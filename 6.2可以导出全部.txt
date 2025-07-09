@@ -1,0 +1,389 @@
+WITH antibiotic_class_map AS (
+    -- 原有抗生素分类代码
+    SELECT 
+        itemid,
+        CASE
+            WHEN itemid IN (225850,225855,225853,229587) 
+                THEN 'cephalosporin_1_3gen'
+            WHEN itemid IN (225851) 
+                THEN 'cephalosporin_4gen'
+            WHEN itemid IN (225893,225888,225842,225892,225843,225890) 
+                THEN 'penicillin'
+            WHEN itemid IN (225883,225876,229061) 
+                THEN 'carbapenem'
+            WHEN itemid IN (225859,225879,225886) 
+                THEN 'fluoroquinolone'
+            WHEN itemid IN (225845) 
+                THEN 'macrolide'
+            WHEN itemid IN (225798) 
+                THEN 'glycopeptides'
+            WHEN itemid IN (225875,225902) 
+                THEN 'aminoglycosides'
+            ELSE 'unclassified'
+        END AS antibiotic_class,
+        MAX(label) AS drug_name
+    FROM mimiciv_icu.d_items
+    GROUP BY itemid
+),
+antibiotic_exposures AS (
+    -- 原有抗生素暴露代码
+    SELECT 
+        ie.stay_id,
+        ie.subject_id,
+        ie.hadm_id,
+        acm.antibiotic_class,
+        MAX(acm.drug_name) AS drug_name,
+        MIN(ie.starttime) AS exposure_start,
+        MAX(ie.endtime) AS exposure_end,
+        SUM(ie.amount) AS dose_val,
+        MAX(ie.amountuom) AS dose_unit,
+        MAX(ie.endtime) + INTERVAL '48 HOURS' AS exposure_window_end
+    FROM mimiciv_icu.inputevents ie
+    INNER JOIN mimiciv_derived.icustay_detail icu 
+        ON ie.stay_id = icu.stay_id
+    INNER JOIN work.keyan_eswofg_mimic_subject subj 
+        ON ie.stay_id = subj.stay_id
+    INNER JOIN antibiotic_class_map acm 
+        ON ie.itemid = acm.itemid
+    WHERE 
+        ie.starttime BETWEEN icu.icu_intime AND icu.icu_outtime
+        AND acm.antibiotic_class <> 'unclassified'
+    GROUP BY 
+        ie.stay_id, ie.subject_id, ie.hadm_id, 
+        acm.antibiotic_class
+),
+-- 机械通气数据CTE
+mechanical_ventilation AS (
+    SELECT 
+        ve.stay_id,
+        ROUND(SUM(MIMICIV_DERIVED.DATETIME_DIFF(ve.endtime, ve.starttime, 'HOUR')), 2) AS ventilation_hour,
+        MIN(ve.starttime) AS ventilation_first_time,
+        CASE WHEN SUM(MIMICIV_DERIVED.DATETIME_DIFF(ve.endtime, ve.starttime, 'HOUR')) > 0 THEN 1 ELSE 0 END AS ventilation
+    FROM mimiciv_derived.ventilation ve
+    INNER JOIN mimiciv_derived.icustay_detail icu 
+        ON ve.stay_id = icu.stay_id
+    INNER JOIN work.keyan_eswofg_mimic_subject subj 
+        ON ve.stay_id = subj.stay_id
+    WHERE ve.starttime >= icu.icu_intime
+        AND ve.ventilation_status IN ('NonInvasiveVent','SupplementalOxygen','None','HFNC')
+    GROUP BY ve.stay_id
+	),
+-- 使用您提供的谵妄检测逻辑（修改版）
+delirium_events AS (
+    -- 原有谵妄检测代码
+    WITH aa AS (
+        SELECT 
+            ce.subject_id,
+            ce.hadm_id,
+            ie.stay_id,
+            ce.charttime,
+            ce.valuenum,
+            ce.value,
+            ROW_NUMBER() OVER (PARTITION BY ie.stay_id ORDER BY ce.charttime) AS rn
+        FROM mimiciv_icu.chartevents ce
+        INNER JOIN mimiciv_icu.icustays ie 
+            ON ce.hadm_id = ie.hadm_id
+        WHERE 
+            ce.itemid IN (228337, 228300, 229326)
+            AND ce.value::text !~* 'Unable to Assess'
+            AND ce.valuenum IS NOT NULL
+            AND ce.charttime >= ie.intime
+    ),
+    bb AS (
+        SELECT 
+            ce.subject_id,
+            ce.hadm_id,
+            ie.stay_id,
+            ce.charttime,
+            ce.valuenum,
+            ce.value,
+            ROW_NUMBER() OVER (PARTITION BY ie.stay_id ORDER BY ce.charttime) AS rn
+        FROM mimiciv_icu.chartevents ce
+        INNER JOIN mimiciv_icu.icustays ie 
+            ON ce.hadm_id = ie.hadm_id
+        WHERE 
+            ce.itemid IN (228336, 228301, 229325)
+            AND ce.value::text !~* 'Unable to Assess'
+            AND ce.valuenum IS NOT NULL
+            AND ce.charttime >= ie.intime
+    ),
+    cc AS (
+        SELECT 
+            ce.subject_id,
+            ce.hadm_id,
+            ie.stay_id,
+            ce.charttime,
+            ce.valuenum,
+            ce.value,
+            ROW_NUMBER() OVER (PARTITION BY ie.stay_id ORDER BY ce.charttime) AS rn
+        FROM mimiciv_icu.chartevents ce
+        INNER JOIN mimiciv_icu.icustays ie 
+            ON ce.hadm_id = ie.hadm_id
+        WHERE 
+            ce.itemid IN (228302, 228334)
+            AND ce.value::text !~* 'Unable to Assess'
+            AND ce.valuenum IS NOT NULL
+            AND ce.charttime >= ie.intime
+    ),
+    dd AS (
+        SELECT 
+            ce.subject_id,
+            ce.hadm_id,
+            ie.stay_id,
+            ce.charttime,
+            ce.valuenum,
+            ce.value,
+            ROW_NUMBER() OVER (PARTITION BY ie.stay_id ORDER BY ce.charttime) AS rn
+        FROM mimiciv_icu.chartevents ce
+        INNER JOIN mimiciv_icu.icustays ie 
+            ON ce.hadm_id = ie.hadm_id
+        WHERE 
+            ce.itemid IN (228335, 228303, 229324)
+            AND ce.value::text !~* 'Unable to Assess'
+            AND ce.valuenum IS NOT NULL
+            AND ce.charttime >= ie.intime
+    ),
+    ee AS (
+        SELECT 
+            aa.subject_id,
+            aa.hadm_id,
+            aa.stay_id,
+            aa.charttime,
+            aa.valuenum AS ms,
+            bb.valuenum AS inatt,
+            cc.valuenum AS rass,
+            dd.valuenum AS dt,
+            (aa.valuenum + bb.valuenum + cc.valuenum) AS d123,
+            (aa.valuenum + bb.valuenum + dd.valuenum) AS d124
+        FROM aa
+        LEFT JOIN bb ON aa.stay_id = bb.stay_id AND aa.charttime = bb.charttime
+        LEFT JOIN cc ON aa.stay_id = cc.stay_id AND aa.charttime = cc.charttime
+        LEFT JOIN dd ON aa.stay_id = dd.stay_id AND aa.charttime = dd.charttime
+    ),
+    delirium_flags AS (
+        SELECT
+            stay_id,
+            charttime,
+            CASE 
+                WHEN d123 >= 3 OR d124 >= 3 THEN 1
+                ELSE 0
+            END AS delirium_positive
+        FROM ee
+    ),
+    first_delirium AS (
+        SELECT
+            stay_id,
+            MIN(charttime) AS first_delirium_time
+        FROM delirium_flags
+        WHERE delirium_positive = 1
+        GROUP BY stay_id
+    )
+    SELECT 
+        subj.stay_id,
+        fd.first_delirium_time
+    FROM work.keyan_eswofg_mimic_subject subj
+    LEFT JOIN first_delirium fd 
+        ON subj.stay_id = fd.stay_id
+),
+-- 其余部分保持不变
+fixed_covariates AS (
+    SELECT DISTINCT(SUBJECT.SUBJECT_ID),
+	SUBJECT.STAY_ID,
+	SUBJECT.HADM_ID,
+	ROUND(AGE.AGE,0) AS AGE,
+	ICU.GENDER,
+	ICU.RACE,
+	WEIGHT.WEIGHT,
+	HEIGHT.HEIGHT,
+	ADMIT.INSURANCE,
+	ADMIT.LANGUAGE,
+	ADMIT.MARITAL_STATUS,
+	CASE 
+        WHEN ICUSTAYS.FIRST_CAREUNIT IS NOT NULL THEN 
+            regexp_replace(ICUSTAYS.FIRST_CAREUNIT, '.*\((.*)\).*', '\1')
+        ELSE 
+            NULL 
+    END AS MICU_CODE
+FROM WORK.keyan_eswofg_mimic_subject AS SUBJECT
+LEFT JOIN MIMICIV_DERIVED.AGE AS AGE ON SUBJECT.HADM_ID = AGE.HADM_ID
+LEFT JOIN MIMICIV_DERIVED.ICUSTAY_DETAIL AS ICU ON SUBJECT.STAY_ID = ICU.STAY_ID
+LEFT JOIN MIMICIV_DERIVED.FIRST_DAY_WEIGHT AS WEIGHT ON SUBJECT.STAY_ID = WEIGHT.STAY_ID
+LEFT JOIN MIMICIV_ICU.ICUSTAYS AS ICUSTAYS ON SUBJECT.STAY_ID = ICUSTAYS.STAY_ID
+LEFT JOIN MIMICIV_HOSP.ADMISSIONS AS ADMIT ON SUBJECT.HADM_ID = ADMIT.HADM_ID
+LEFT JOIN MIMICIV_DERIVED.FIRST_DAY_HEIGHT AS HEIGHT ON SUBJECT.STAY_ID = HEIGHT.STAY_ID
+),
+comorbidities AS (
+    SELECT 
+        hadm_id,
+        MAX(CASE WHEN icd_code IN ('4019','I10','4011','I161','4010') THEN 1 ELSE 0 END) AS hypertension,
+        MAX(CASE WHEN icd_code IN ('4280','42832','42822','I5032','42833','I5033','I5022','42823','I5023','I509','42830','42843','42831','I5030','42821','42842','I5021','I5020','42820','I5031','I5043','I5042','40491','40291','42841','4289','42840','I5084','I50810','I5041','I5082','I5040','4281','I50814','I50811','I50813','I50812','40201','40492','I5089','I5083') THEN 1 ELSE 0 END) AS heart_failure,
+        MAX(CASE WHEN icd_code IN ('5849','N179','5845','N170') THEN 1 ELSE 0 END) AS renal_failure,
+        MAX(CASE WHEN icd_code IN ('5715','5712','K7469','K7460','K7031','K7030','5716','K743') THEN 1 ELSE 0 END) AS cirrhosis,
+        MAX(CASE WHEN icd_code IN ('E119','E1122','E1165','E1140','E1151','E11319','E1142','E1121','E11649','E11621','E1169','E1143','E1152','E118','E11610','E11622','E1110','E11628','E1139','E1136','E1022','E10319','E1065','E1040','E1043','E10649','E1010','E1021','E109','E1042') THEN 1 ELSE 0 END) AS diabetes
+    FROM mimiciv_hosp.diagnoses_icd
+    GROUP BY hadm_id
+),
+icu_scores AS (
+  SELECT DISTINCT(SUBJECT.SUBJECT_ID),SUBJECT.STAY_ID,
+	SUBJECT.HADM_ID,
+	SOFA.SOFA,
+	APSIII.APSIII,
+	SIRS.SIRS,
+	SAPSII.SAPSII,
+	OASIS.OASIS,
+	GCS.GCS_MIN AS GCS,
+	CHARLSON.CHARLSON_COMORBIDITY_INDEX AS CHARLSON
+FROM WORK.keyan_eswofg_mimic_subject AS SUBJECT
+LEFT JOIN MIMICIV_DERIVED.FIRST_DAY_SOFA AS SOFA ON SUBJECT.STAY_ID = SOFA.STAY_ID
+LEFT JOIN MIMICIV_DERIVED.APSIII AS APSIII ON SUBJECT.STAY_ID = APSIII.STAY_ID
+LEFT JOIN MIMICIV_DERIVED.SIRS AS SIRS ON SUBJECT.STAY_ID = SIRS.STAY_ID
+LEFT JOIN MIMICIV_DERIVED.SAPSII AS SAPSII ON SUBJECT.STAY_ID = SAPSII.STAY_ID
+LEFT JOIN MIMICIV_DERIVED.OASIS AS OASIS ON SUBJECT.STAY_ID = OASIS.STAY_ID
+LEFT JOIN MIMICIV_DERIVED.FIRST_DAY_GCS AS GCS ON SUBJECT.STAY_ID = GCS.STAY_ID
+LEFT JOIN MIMICIV_DERIVED.CHARLSON AS CHARLSON ON SUBJECT.HADM_ID = CHARLSON.HADM_ID
+),
+Midazolam AS (
+    SELECT 
+        stay_id,
+        SUM(amount) AS midazolam_amount,
+        MAX(amountuom) AS midazolam_uom
+    FROM mimiciv_icu.inputevents
+    WHERE itemid = 221668
+    GROUP BY stay_id
+),
+Dexmedetomidine AS (
+    SELECT 
+        stay_id,
+        SUM(amount) AS dexmedetomidine_amount,
+        MAX(amountuom) AS dexmedetomidine_uom
+    FROM mimiciv_icu.inputevents
+    WHERE itemid IN (229420, 225150)
+    GROUP BY stay_id
+),
+Propofo AS (
+    SELECT 
+        stay_id,
+        SUM(amount) AS propofo_amount,
+        MAX(amountuom) AS propofo_uom
+    FROM mimiciv_icu.inputevents
+    WHERE itemid = 222168
+    GROUP BY stay_id
+),
+Norepinephrine AS (
+    SELECT 
+        stay_id,
+        SUM(amount) AS norepinephrine_amount,
+        MAX(amountuom) AS norepinephrine_uom
+    FROM mimiciv_icu.inputevents
+    WHERE itemid = 221906
+    GROUP BY stay_id
+),
+prognosis_data AS (
+    SELECT DISTINCT(SUBJECT.SUBJECT_ID),
+        SUBJECT.STAY_ID,
+        SUBJECT.HADM_ID,
+        ICU.ADMITTIME AS ADMIT_TIME,
+        ICU.ICU_INTIME AS ICU_INTIME,
+        ICU.DISCHTIME AS DISCH_TIME,
+        ICU.ICU_OUTTIME AS ICU_OUTTIME,
+        ADMISSIONS.ADMISSION_LOCATION,
+        ADMISSIONS.DISCHARGE_LOCATION,
+        ROUND(MIMICIV_DERIVED.DATETIME_DIFF(ICU.DISCHTIME,ICU.ADMITTIME,'DAY'),2) AS HOSP_DAY,
+        ROUND(MIMICIV_DERIVED.DATETIME_DIFF(ICU.ICU_OUTTIME,ICU.ICU_INTIME,'DAY'),2) AS ICU_DAY,
+        CASE WHEN ICU.DOD IS NOT NULL THEN 1 ELSE NULL END AS IS_DEAD,
+        ICU.DOD AS DEAD_TIME,
+        CASE WHEN ICU.ADMITTIME<ICU.DOD AND ICU.DOD<=ICU.DISCHTIME THEN 1 ELSE 0 END AS IS_HOSP_DEAD,
+        CASE WHEN ICU.ICU_INTIME<ICU.DOD AND ICU.DOD<=ICU.ICU_OUTTIME THEN 1 ELSE 0 END AS IS_ICU_DEAD,
+        ROUND(MIMICIV_DERIVED.DATETIME_DIFF(ICU.DOD,ICU.ADMITTIME,'DAY'),2) AS HOSP_SURVIVAL_DAY,
+        ROUND(MIMICIV_DERIVED.DATETIME_DIFF(ICU.DOD,ICU.ICU_INTIME,'DAY'),2) AS ICU_SURVIVAL_DAY,
+        CASE WHEN (ICU.DOD IS NOT NULL AND 
+               (MIMICIV_DERIVED.DATETIME_DIFF(ICU.DOD, ICU.ADMITTIME, 'DAY') <= 28)) THEN 1 ELSE 0
+        END AS DEATH_WITHIN_HOSP_28DAYS,
+        CASE WHEN (ICU.DOD IS NOT NULL AND 
+               (MIMICIV_DERIVED.DATETIME_DIFF(ICU.DOD, ICU.ICU_INTIME, 'DAY') <= 28)) THEN 1 ELSE 0
+        END AS DEATH_WITHIN_ICU_28DAYS
+    FROM WORK.keyan_eswofg_mimic_subject AS SUBJECT
+    LEFT JOIN MIMICIV_DERIVED.ICUSTAY_DETAIL AS ICU ON SUBJECT.STAY_ID = ICU.STAY_ID
+    LEFT JOIN MIMICIV_HOSP.ADMISSIONS ON SUBJECT.HADM_ID = ADMISSIONS.HADM_ID
+),
+final_dataset AS (
+    SELECT
+       
+        subj.stay_id,
+        subj.subject_id,
+        subj.hadm_id,
+        -- 添加抗生素类别标识
+        CASE 
+            WHEN ae.antibiotic_class IS NULL THEN 'No_Antibiotic'
+            ELSE ae.antibiotic_class 
+        END AS antibiotic_class,
+        fc.age,
+        fc.gender,
+        fc.race,
+        fc.weight,
+        fc.height,
+        fc.insurance,
+        fc.language,
+        fc.marital_status,
+        fc.micu_code,
+        cm.hypertension,
+        cm.heart_failure,
+        cm.renal_failure,
+        cm.cirrhosis,
+        cm.diabetes,
+        sc.sofa,
+        sc.apsiii,
+        sc.sirs,
+        sc.sapsii,
+        sc.oasis,
+        sc.gcs,
+        sc.charlson,
+        COALESCE(m.midazolam_amount, 0) AS midazolam_amount,
+        m.midazolam_uom,
+        COALESCE(d.dexmedetomidine_amount, 0) AS dexmedetomidine_amount,
+        d.dexmedetomidine_uom,
+        COALESCE(p.propofo_amount, 0) AS propofo_amount,
+        p.propofo_uom,
+        COALESCE(n.norepinephrine_amount, 0) AS norepinephrine_amount,
+        n.norepinephrine_uom,
+        pd.ADMIT_TIME,
+        pd.ICU_INTIME,
+        pd.DISCH_TIME,
+        pd.ICU_OUTTIME,
+        pd.ADMISSION_LOCATION,
+        pd.DISCHARGE_LOCATION,
+        pd.HOSP_DAY,
+        pd.ICU_DAY,
+        pd.IS_DEAD,
+        pd.DEAD_TIME,
+        pd.IS_HOSP_DEAD,
+        pd.IS_ICU_DEAD,
+        pd.HOSP_SURVIVAL_DAY,
+        pd.ICU_SURVIVAL_DAY,
+        pd.DEATH_WITHIN_HOSP_28DAYS,
+        pd.DEATH_WITHIN_ICU_28DAYS,
+        -- 谵妄结局
+        CASE WHEN de.first_delirium_time BETWEEN ae.exposure_start AND ae.exposure_window_end
+             THEN 1 ELSE 0 
+        END AS delirium_48h,
+        de.first_delirium_time AS delirium_time,
+        -- 新添加的机械通气字段
+        mv.ventilation_hour,
+        mv.ventilation,
+        mv.ventilation_first_time
+    FROM work.keyan_eswofg_mimic_subject subj  -- 以患者表为主表
+    LEFT JOIN antibiotic_exposures ae ON subj.stay_id = ae.stay_id
+    LEFT JOIN fixed_covariates fc ON ae.stay_id = fc.stay_id
+    LEFT JOIN comorbidities cm ON ae.hadm_id = cm.hadm_id
+    LEFT JOIN icu_scores sc ON ae.stay_id = sc.stay_id
+    LEFT JOIN delirium_events de ON ae.stay_id = de.stay_id
+    LEFT JOIN Midazolam m ON ae.stay_id = m.stay_id
+    LEFT JOIN Dexmedetomidine d ON ae.stay_id = d.stay_id
+    LEFT JOIN Propofo p ON ae.stay_id = p.stay_id
+    LEFT JOIN Norepinephrine n ON ae.stay_id = n.stay_id
+    LEFT JOIN prognosis_data pd ON ae.stay_id = pd.stay_id
+    LEFT JOIN mechanical_ventilation mv ON ae.stay_id = mv.stay_id  -- 新添加的连接
+)
+
+SELECT * FROM final_dataset
+ORDER BY stay_id;
